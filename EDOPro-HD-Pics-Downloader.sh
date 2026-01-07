@@ -153,29 +153,30 @@ download_card() {
     local card_json="$1"
     local force_overwrite="$2"
     
-    # Parse card data using grep and sed (basic JSON parsing)
-    local card_id=$(echo "$card_json" | grep -o '"id":[0-9]*' | head -1 | sed 's/"id"://')
-    local card_type=$(echo "$card_json" | grep -o '"humanReadableCardType":"[^"]*"' | head -1 | sed 's/"humanReadableCardType":"\([^"]*\)"/\1/')
+    # Parse card data using awk for efficiency (single pass)
+    local card_data=$(echo "$card_json" | awk '
+        match($0, /"id":([0-9]+)/, arr) { if (!card_id) card_id = arr[1] }
+        match($0, /"humanReadableCardType":"([^"]*)"/, arr) { card_type = arr[1] }
+        match($0, /"image_url":"([^"]*)"/, arr) { print "URL:" arr[1] }
+        match($0, /"image_url_cropped":"([^"]*)"/, arr) { cropped = arr[1] }
+        END { 
+            print "ID:" card_id
+            print "TYPE:" card_type
+            if (cropped) print "CROPPED:" cropped
+        }
+    ')
+    
+    local card_id=$(echo "$card_data" | grep "^ID:" | cut -d: -f2)
+    local card_type=$(echo "$card_data" | grep "^TYPE:" | cut -d: -f2-)
+    local cropped_url=$(echo "$card_data" | grep "^CROPPED:" | cut -d: -f2-)
     
     if [[ -z "$card_id" ]]; then
         return 1
     fi
     
-    # Extract all card images (handles alternate arts)
-    local image_urls=$(echo "$card_json" | grep -o '"image_url":"[^"]*"' | sed 's/"image_url":"\([^"]*\)"/\1/')
-    local image_ids=$(echo "$card_json" | grep -o '"id":[0-9]*' | sed 's/"id"://')
-    
-    # Convert to arrays
-    local -a urls_array=()
-    local -a ids_array=()
-    
-    while IFS= read -r url; do
-        [[ -n "$url" ]] && urls_array+=("$url")
-    done <<< "$image_urls"
-    
-    while IFS= read -r id; do
-        [[ -n "$id" ]] && ids_array+=("$id")
-    done <<< "$image_ids"
+    # Extract image URLs and IDs
+    readarray -t urls_array < <(echo "$card_data" | grep "^URL:" | cut -d: -f2-)
+    readarray -t ids_array < <(echo "$card_json" | grep -o '"id":[0-9]*' | sed 's/"id"://')
     
     # Download main images
     local success=0
@@ -183,12 +184,13 @@ download_card() {
     local idx=0
     
     for img_id in "${ids_array[@]}"; do
+        [[ -z "$img_id" ]] && continue
         local output_file="$PICS_DIR/${img_id}.jpg"
         
         if [[ -f "$output_file" ]] && [[ "$force_overwrite" != "true" ]]; then
             skipped=$((skipped + 1))
         else
-            if [[ $idx -lt ${#urls_array[@]} ]]; then
+            if [[ $idx -lt ${#urls_array[@]} ]] && [[ -n "${urls_array[$idx]}" ]]; then
                 if download_image "${urls_array[$idx]}" "$output_file"; then
                     success=$((success + 1))
                 else
@@ -201,16 +203,12 @@ download_card() {
     done
     
     # Handle Field Spell cropped images
-    if [[ "$card_type" == "Field Spell" ]]; then
-        local cropped_url=$(echo "$card_json" | grep -o '"image_url_cropped":"[^"]*"' | head -1 | sed 's/"image_url_cropped":"\([^"]*\)"/\1/')
+    if [[ "$card_type" == "Field Spell" ]] && [[ -n "$cropped_url" ]]; then
+        local cropped_file="$FIELD_DIR/${card_id}.jpg"
         
-        if [[ -n "$cropped_url" ]]; then
-            local cropped_file="$FIELD_DIR/${card_id}.jpg"
-            
-            if [[ ! -f "$cropped_file" ]] || [[ "$force_overwrite" == "true" ]]; then
-                if ! download_image "$cropped_url" "$cropped_file"; then
-                    log_message "WARNING" "Failed to download cropped image for Field Spell ID: $card_id"
-                fi
+        if [[ ! -f "$cropped_file" ]] || [[ "$force_overwrite" == "true" ]]; then
+            if ! download_image "$cropped_url" "$cropped_file"; then
+                log_message "WARNING" "Failed to download cropped image for Field Spell ID: $card_id"
             fi
         fi
     fi
@@ -250,8 +248,8 @@ process_downloads() {
         
         log_message "INFO" "Starting download with $max_jobs concurrent connections..."
         
-        # Process each card
-        jq -c '.data[]' "$data_file" | while read -r card; do
+        # Process each card using process substitution to avoid subshell issues
+        while read -r card; do
             # Wait if we have too many background jobs
             while [[ $(jobs -r | wc -l) -ge $max_jobs ]]; do
                 sleep 0.1
@@ -261,7 +259,7 @@ process_downloads() {
                 result=$(download_card "$card" "$force_overwrite")
                 echo "$result" >> "$temp_dir/results.txt"
             ) &
-        done
+        done < <(jq -c '.data[]' "$data_file")
         
         # Wait for all background jobs to complete
         wait
@@ -283,29 +281,65 @@ process_downloads() {
     else
         # Fallback without jq (less efficient but functional)
         log_message "WARNING" "jq not found. Using fallback parser (slower)."
+        log_message "INFO" "For better performance, install jq: brew install jq"
         
-        # Extract cards manually
-        local card_count=$(grep -o '"id":[0-9]*' "$data_file" | wc -l)
-        log_message "INFO" "Found approximately $card_count card entries"
+        # Create temporary directory for results
+        local temp_dir=$(mktemp -d)
+        local max_jobs=$MAX_CONCURRENT
         
-        # Simple sequential processing
-        local processed=0
-        local total_estimate=13000  # Approximate total cards
+        # Extract card IDs manually
+        local -a card_ids=()
+        while IFS= read -r id; do
+            [[ -n "$id" ]] && card_ids+=("$id")
+        done < <(grep -o '"id":[0-9]*' "$data_file" | sed 's/"id"://' | sort -u)
         
-        # Split JSON into individual cards (basic approach)
-        awk '/"id":/ {print}' "$data_file" | while read -r line; do
-            if [[ $(jobs -r | wc -l) -ge $MAX_CONCURRENT ]]; then
-                wait -n 2>/dev/null || true
-            fi
+        local total_cards=${#card_ids[@]}
+        log_message "SUCCESS" "Successfully retrieved $total_cards unique card IDs"
+        log_message "INFO" "Starting download with $max_jobs concurrent connections..."
+        
+        # Download each card
+        for card_id in "${card_ids[@]}"; do
+            # Wait if we have too many background jobs
+            while [[ $(jobs -r | wc -l) -ge $max_jobs ]]; do
+                sleep 0.1
+            done
             
-            processed=$((processed + 1))
-            if [[ $((processed % 100)) -eq 0 ]]; then
-                log_message "INFO" "Progress: $processed cards processed..."
-            fi
+            (
+                # Extract card data for this ID from the JSON
+                local card_json=$(awk -v id="$card_id" '
+                    /"id":'"$card_id"'[^0-9]/ {in_card=1; card=""}
+                    in_card {card=card $0}
+                    in_card && /}[,\]]/ {print card; in_card=0}
+                ' "$data_file")
+                
+                if [[ -n "$card_json" ]]; then
+                    result=$(download_card "$card_json" "$force_overwrite")
+                    echo "$result" >> "$temp_dir/results.txt"
+                fi
+            ) &
         done
         
+        # Wait for all background jobs to complete
         wait
+        
+        # Count results
+        local success=0
+        local skipped=0
+        local errors=0
+        local processed=0
+        
+        if [[ -f "$temp_dir/results.txt" ]]; then
+            success=$(grep -c "SUCCESS" "$temp_dir/results.txt" 2>/dev/null || echo 0)
+            skipped=$(grep -c "SKIPPED" "$temp_dir/results.txt" 2>/dev/null || echo 0)
+            errors=$(grep -c "ERROR" "$temp_dir/results.txt" 2>/dev/null || echo 0)
+            processed=$((success + skipped + errors))
+        fi
+        
+        # Clean up
+        rm -rf "$temp_dir"
+        
         log_message "SUCCESS" "Download completed!"
+        log_message "INFO" "Total: $total_cards | Processed: $processed | Skipped: $skipped | Errors: $errors"
     fi
 }
 
