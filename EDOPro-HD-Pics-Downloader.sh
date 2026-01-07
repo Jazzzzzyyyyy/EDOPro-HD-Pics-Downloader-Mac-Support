@@ -97,6 +97,7 @@ fetch_card_data() {
     log_message "INFO" "Retrieving card data from YGOProDeck API..."
     
     local temp_file=$(mktemp)
+    local temp_error=$(mktemp)
     local http_code
     
     # Use curl to fetch data with timeout and retry
@@ -104,13 +105,22 @@ fetch_card_data() {
         --max-time "$TIMEOUT_SECONDS" \
         --retry "$RETRY_COUNT" \
         --retry-delay 2 \
-        "$API_URL")
+        "$API_URL" 2>"$temp_error")
     
     if [[ "$http_code" != "200" ]]; then
-        log_message "ERROR" "API returned HTTP status code: $http_code"
-        rm -f "$temp_file"
+        log_message "ERROR" "API request failed with HTTP status code: $http_code"
+        if [[ "$http_code" == "000" ]]; then
+            log_message "ERROR" "Network error: Unable to connect to API server"
+            if [[ -s "$temp_error" ]]; then
+                log_message "ERROR" "Details: $(cat "$temp_error")"
+            fi
+            log_message "ERROR" "Please check your internet connection and try again"
+        fi
+        rm -f "$temp_file" "$temp_error"
         return 1
     fi
+    
+    rm -f "$temp_error"
     
     if [[ ! -s "$temp_file" ]]; then
         log_message "ERROR" "API returned empty response"
